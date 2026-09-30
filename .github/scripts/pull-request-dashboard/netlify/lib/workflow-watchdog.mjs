@@ -1,6 +1,9 @@
 export const DEFAULT_STALE_RUN_MS = 30 * 60 * 1000;
 
 const DASHBOARD_RUN_NAME_PREFIX = "pull-request-dashboard-";
+const MAX_CANDIDATES_PER_WORKFLOW = 4;
+const MAX_CANDIDATES_PER_INVOCATION = 8;
+const WATCHDOG_INTERVAL_MS = 15 * 60 * 1000;
 
 export const WATCHED_DASHBOARD_WORKFLOWS = Object.freeze([
   Object.freeze({ workflowId: "pull-request-dashboard-drain.yml" }),
@@ -13,6 +16,7 @@ export const WATCHED_DASHBOARD_WORKFLOWS = Object.freeze([
     event: "workflow_dispatch",
     groupByRunName: true,
     runNamePrefix: DASHBOARD_RUN_NAME_PREFIX,
+    runNameSuffix: "-refresh",
   }),
   Object.freeze({
     workflowId: "pull-request-dashboard-deploy-webhook.yml",
@@ -42,75 +46,186 @@ export async function cancelStalledDashboardRuns({
 
   const checkedAt = now();
   const staleBefore = checkedAt - staleRunMs;
-  const cancelled = [];
+  const requested = [];
+  const confirmed = [];
+  const unconfirmed = [];
+  const conflicts = [];
+  let remainingCandidates = MAX_CANDIDATES_PER_INVOCATION;
+  const workflowOffset = watchedWorkflows.length
+    ? Math.floor(checkedAt / WATCHDOG_INTERVAL_MS) % watchedWorkflows.length
+    : 0;
+  const workflows = [
+    ...watchedWorkflows.slice(workflowOffset),
+    ...watchedWorkflows.slice(0, workflowOffset),
+  ];
 
-  for (const workflow of watchedWorkflows) {
+  for (const workflow of workflows) {
+    function finishIfStopped(details, current) {
+      if (current && current.status !== "completed") {
+        return false;
+      }
+      if (current?.conclusion === "cancelled") {
+        confirmed.push(details);
+      } else {
+        unconfirmed.push({ ...details, reason: current ? "finished" : "not_found" });
+      }
+      return true;
+    }
+
     const runs = await actions.listWorkflowRuns(workflow.workflowId, {
       event: workflow.event,
       statuses: ACTIVE_RUN_STATUSES,
     });
-    const matchingRuns = runs.filter((run) =>
-      (!workflow.event || run.event === workflow.event) &&
-      (!workflow.runNamePrefix ||
-        (
-          typeof run.display_title === "string" &&
-          run.display_title.startsWith(workflow.runNamePrefix)
-        ))
-    );
+    const matchingRuns = runs.filter((run) => matchesWorkflow(run, workflow));
+
     const candidates = matchingRuns
       .filter((run) => {
-        const createdAt = Date.parse(run.created_at);
+        const createdAt = runAttemptStart(run);
         return BLOCKING_RUN_STATUSES.has(run.status) &&
           Number.isFinite(createdAt) &&
           createdAt <= staleBefore &&
-          matchingRuns.some((newer) =>
-            WAITING_RUN_STATUSES.has(newer.status) &&
-            Date.parse(newer.created_at) > createdAt &&
-            sameConcurrencyGroup(run, newer, workflow)
-          );
+          findNewerRun(run, matchingRuns, workflow);
       })
       .sort((left, right) =>
         Date.parse(left.created_at) - Date.parse(right.created_at)
       );
+    // Keep each candidate slice for a full workflow rotation so every workflow
+    // can receive budget before its slice advances.
+    const offset = candidates.length > MAX_CANDIDATES_PER_WORKFLOW
+      ? Math.floor(checkedAt / (WATCHDOG_INTERVAL_MS * workflows.length)) *
+        MAX_CANDIDATES_PER_WORKFLOW % candidates.length
+      : 0;
+    const selected = [...candidates.slice(offset), ...candidates.slice(0, offset)]
+      .slice(0, Math.min(MAX_CANDIDATES_PER_WORKFLOW, remainingCandidates));
+    remainingCandidates -= selected.length;
 
-    for (const run of candidates) {
-      const jobs = await actions.listRunJobs(run.id);
-      if (!canCancelStalledRun(jobs, staleBefore)) {
-        continue;
-      }
-      const newerRun = matchingRuns
-        .filter((candidate) =>
-          WAITING_RUN_STATUSES.has(candidate.status) &&
-          Date.parse(candidate.created_at) > Date.parse(run.created_at) &&
-          sameConcurrencyGroup(run, candidate, workflow)
-        )
-        .sort((left, right) =>
-          Date.parse(left.created_at) - Date.parse(right.created_at)
-        )[0];
-      try {
-        await actions.cancelWorkflowRun(run.id);
-      } catch (error) {
-        if (error.githubStatusCode === 409) {
-          continue;
-        }
-        throw error;
-      }
-      cancelled.push({
+    for (const run of selected) {
+      const newerRun = findNewerRun(run, matchingRuns, workflow);
+      const createdAt = runAttemptStart(run);
+      const details = {
         workflowId: workflow.workflowId,
         runId: run.id,
         newerRunId: newerRun.id,
         ageMinutes: Math.floor(
-          (checkedAt - Date.parse(run.created_at)) / (60 * 1000),
+          (checkedAt - createdAt) / (60 * 1000),
         ),
-      });
-      break;
+      };
+      const jobs = await getJobsIfFound(actions, run.id);
+      if (jobs === null || !canCancelStalledRun(jobs, staleBefore)) {
+        continue;
+      }
+      const [current, currentNewer] = await Promise.all([
+        getRunIfFound(actions, run.id),
+        getRunIfFound(actions, newerRun.id),
+      ]);
+      if (!current) {
+        continue;
+      }
+      const currentNewerStart = currentNewer
+        ? runAttemptStart(currentNewer)
+        : NaN;
+      if (
+        !BLOCKING_RUN_STATUSES.has(current.status) ||
+        current.run_attempt !== run.run_attempt ||
+        !Number.isFinite(runAttemptStart(current)) ||
+        runAttemptStart(current) > now() - staleRunMs ||
+        !matchesWorkflow(current, workflow) ||
+        !currentNewer ||
+        !WAITING_RUN_STATUSES.has(currentNewer.status) ||
+        !matchesWorkflow(currentNewer, workflow) ||
+        !Number.isFinite(currentNewerStart) ||
+        currentNewerStart <= runAttemptStart(current) ||
+        !sameConcurrencyGroup(current, currentNewer, workflow) ||
+        !canCancelStalledRun(jobs, now() - staleRunMs)
+      ) {
+        continue;
+      }
+      try {
+        await actions.forceCancelWorkflowRun(run.id);
+      } catch (error) {
+        if (error.githubStatusCode !== 409) {
+          throw error;
+        }
+        const afterConflict = await getRunIfFound(actions, run.id);
+        if (!finishIfStopped(details, afterConflict)) {
+          conflicts.push(details);
+        }
+        continue;
+      }
+      requested.push(details);
+      const afterRequest = await getRunIfFound(actions, run.id);
+      finishIfStopped(details, afterRequest);
     }
   }
 
   return {
     checkedWorkflows: watchedWorkflows.length,
-    cancelled,
+    requested,
+    confirmed,
+    unconfirmed,
+    conflicts,
   };
+}
+
+async function getRunIfFound(actions, runId) {
+  try {
+    const run = await actions.getWorkflowRun(runId);
+    if (!run || typeof run !== "object") {
+      throw new Error(`GitHub workflow run ${runId} lookup returned no run`);
+    }
+    return run;
+  } catch (error) {
+    if (error.githubStatusCode === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function getJobsIfFound(actions, runId) {
+  try {
+    return await actions.listRunJobs(runId);
+  } catch (error) {
+    if (error.githubStatusCode === 404 &&
+        await getRunIfFound(actions, runId) === null) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function matchesWorkflow(run, workflow) {
+  return (!workflow.event || run.event === workflow.event) &&
+    (!workflow.runNamePrefix ||
+      (typeof run.display_title === "string" &&
+        run.display_title.startsWith(workflow.runNamePrefix))) &&
+    (!workflow.runNameSuffix ||
+      (typeof run.display_title === "string" &&
+        run.display_title.endsWith(workflow.runNameSuffix)));
+}
+
+function runAttemptStart(run) {
+  const createdAt = Date.parse(run.created_at);
+  if (run.run_attempt > 1) {
+    // A rerun keeps the original created_at; without its own start time, its age is unknown.
+    const startedAt = Date.parse(run.run_started_at);
+    return startedAt >= createdAt ? startedAt : NaN;
+  }
+  return createdAt;
+}
+
+function findNewerRun(run, runs, workflow) {
+  return runs
+    .filter((candidate) => {
+      const candidateStart = runAttemptStart(candidate);
+      return WAITING_RUN_STATUSES.has(candidate.status) &&
+        Number.isFinite(candidateStart) &&
+        candidateStart > runAttemptStart(run) &&
+        sameConcurrencyGroup(run, candidate, workflow);
+    })
+    .sort((left, right) =>
+      runAttemptStart(left) - runAttemptStart(right)
+    )[0];
 }
 
 function sameConcurrencyGroup(left, right, workflow) {
@@ -122,14 +237,23 @@ function canCancelStalledRun(jobs, staleBefore) {
   const unfinished = jobs.filter((job) => job.status !== "completed");
   if (unfinished.length !== jobs.length) {
     return unfinished.length > 0 && unfinished.every((job) => {
-      const startedAt = Date.parse(job.started_at);
-      return job.status === "waiting" &&
+      const startedAt = Date.parse(
+        job.status === "queued" ? job.started_at || job.created_at : job.started_at,
+      );
+      return (job.status === "waiting" || job.status === "queued") &&
         !wasAssigned(job) &&
         Number.isFinite(startedAt) &&
         startedAt <= staleBefore;
     });
   }
-  return jobs.every((job) => !wasAssigned(job));
+  return jobs.every((job) =>
+    (job.status === "in_progress" ||
+      job.status === "waiting" ||
+      (job.status === "queued" &&
+        Number.isFinite(Date.parse(job.started_at || job.created_at)) &&
+        Date.parse(job.started_at || job.created_at) <= staleBefore)) &&
+    !wasAssigned(job)
+  );
 }
 
 function wasAssigned(job) {

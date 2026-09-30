@@ -172,9 +172,15 @@ export async function createGitHubActionsClient(
         }
       }
     },
-    async cancelWorkflowRun(runId) {
+    async getWorkflowRun(runId) {
+      return githubJson(
+        `${GITHUB_API_ROOT}/actions/runs/${runId}`,
+        token,
+      );
+    },
+    async forceCancelWorkflowRun(runId) {
       await githubFetch(
-        `${GITHUB_API_ROOT}/actions/runs/${runId}/cancel`,
+        `${GITHUB_API_ROOT}/actions/runs/${runId}/force-cancel`,
         token,
         { method: "POST" },
       );
